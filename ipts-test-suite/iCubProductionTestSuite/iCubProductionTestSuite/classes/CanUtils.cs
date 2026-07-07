@@ -23,12 +23,15 @@ namespace iCubProductionTestSuite.classes
     {
         private List<String> ports;
         private CanPort port;
+        private int netPort = -1;
         private int messageId;
+        private bool messageFilterConfigured = false;
 
         private List<string> lastSentData = null;
         private int maxSendRetries = 2;
         private int maxReceiveRetries = 2;
         private int receiveTimeoutMs = 5000;
+        private int transmitTimeoutMs = 1000;
 
         private static readonly ILog log = LogManager.GetLogger(typeof(CanUtils));
 
@@ -36,9 +39,7 @@ namespace iCubProductionTestSuite.classes
 
         public CanUtils(TestInterface ti)
         {
-            // Create a new CAN port instance
-            this.port = new CanPort(Convert.ToInt16(ti.NetPort));           
-            this.messageId = Convert.ToInt32(ti.MessageID, 16);
+            Configure(ti);
         }
 
         // Get list of available CAN ports
@@ -75,7 +76,68 @@ namespace iCubProductionTestSuite.classes
             set
             {
                 port = value;
+                messageFilterConfigured = false;
             }
+        }
+
+        public void Configure(TestInterface ti)
+        {
+            int configuredNetPort = Convert.ToInt16(ti.NetPort);
+            int configuredMessageId = Convert.ToInt32(ti.MessageID, 16);
+
+            if (port != null && netPort == configuredNetPort && messageId == configuredMessageId)
+            {
+                return;
+            }
+
+            ClosePort();
+            if (port != null)
+            {
+                port.Dispose();
+            }
+
+            netPort = configuredNetPort;
+            messageId = configuredMessageId;
+            port = new CanPort(
+                netPort,
+                CanPortMode.FifoMode,
+                receiveTimeoutMs,
+                transmitTimeoutMs,
+                128,
+                32);
+            messageFilterConfigured = false;
+        }
+
+        private void EnsurePortOpen()
+        {
+            if (port == null)
+            {
+                throw new InvalidOperationException("CAN port is not configured");
+            }
+
+            if (!port.IsOpen)
+            {
+                port.Open();
+                port.BitRate = new CanBitRate(CanBitRateTable.Cia1000KBit);
+                port.ReceiveTimeout = receiveTimeoutMs;
+                port.TransmitTimeout = transmitTimeoutMs;
+                messageFilterConfigured = false;
+            }
+
+            if (!messageFilterConfigured)
+            {
+                port.AddToMessageFilter(CanMessageType.Data, messageId);
+                messageFilterConfigured = true;
+            }
+        }
+
+        private void ClosePort()
+        {
+            if (port != null && port.IsOpen)
+            {
+                port.Close();
+            }
+            messageFilterConfigured = false;
         }
 
        
@@ -90,8 +152,8 @@ namespace iCubProductionTestSuite.classes
                 //TODO: review try-catch block and decouple port open/close from send to trigger correctly the exceptions
                 try
                 {
-                    port.Open();
-                    port.BitRate = new CanBitRate(CanBitRateTable.Cia1000KBit);
+                    EnsurePortOpen();
+                    port.PurgeReceiveBuffer();
 
                     CanMessage cmsg = new CanMessage
                     {
@@ -101,7 +163,7 @@ namespace iCubProductionTestSuite.classes
                     for (int i = 0; i < data.Count; i++)
                         cmsg[i] = Convert.ToByte(data[i]);
 
-                    port.Send(ref cmsg);
+                    port.Write(ref cmsg);
                     sent = true;
                     log.InfoFormat("Sent CAN message: {0}", cmsg.ToString());
                 }
@@ -112,6 +174,7 @@ namespace iCubProductionTestSuite.classes
                 }
                 catch (IOException)
                 {
+                    ClosePort();
                     attempts++;
                     if (attempts >= maxSendRetries)
                     {
@@ -120,62 +183,47 @@ namespace iCubProductionTestSuite.classes
                     }
                     System.Threading.Thread.Sleep(100); // Small delay before retry
                 }
-                finally
-                {
-                    if(port.IsOpen)
-                    { 
-                        port.Close();
-                    }
-                }
             }
             return sent;
         }
 
-        public CanMessage receive(List<string> prev_data)
+        public bool TryReceive(List<string> prev_data, out CanMessage cmsg)
         {
             bool received = false;
             lastSentData = prev_data;
+            cmsg = new CanMessage();
+
             if (lastSentData == null)
             {
                 MessageBox.Show("Nessun messaggio CAN inviato da ritentare!", "Errore", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return default(CanMessage);
+                return false;
             }
 
             int attempts = 0;
-            CanMessage cmsg = new CanMessage();
 
             while (attempts < maxReceiveRetries && !received)
             {
                 try
                 {
-                    port.Open();
-                    // Set receive timeout (ms)
-                    port.ReceiveTimeout = receiveTimeoutMs;
-                    // Set CAN bit rate to 1000 KBit/s (1 Mbit/s)
-                    port.BitRate = new CanBitRate(CanBitRateTable.Cia1000KBit);
-                    // Add CAN message filter for expected identifier (from ipts.xml)
-                    port.AddToMessageFilter(CanMessageType.Data, messageId);
+                    EnsurePortOpen();
 
                     // Try to read a CAN message
-                    if (port.Read(ref cmsg) >= 0)
+                    int readMessages = port.Read(ref cmsg);
+                    if (readMessages == 1 && cmsg.DataLength > 0)
                     {
                         received = true;
                         log.Debug(cmsg.ToString());
                         lastSentData.Clear();
-                        return cmsg;
+                        return true;
                     }
+
+                    log.DebugFormat("No valid CAN message received. Read returned {0}, data length is {1}", readMessages, cmsg.DataLength);
                 }
                 catch (IOException)
                 {
                     // Optionally handle port errors here
+                    ClosePort();
                     MessageBox.Show("Problemi nella ricezione dal CAN port. Ritento...", "Warning CAN", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                }
-                finally
-                {
-                    if (port.IsOpen)
-                    {
-                        port.Close();
-                    }
                 }
 
                 // If not received, resend the last message and try again
@@ -185,6 +233,17 @@ namespace iCubProductionTestSuite.classes
             }
 
             MessageBox.Show("CAN timeout dopo vari tentativi di ricezione!", "Errore CAN", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
+        }
+
+        public CanMessage receive(List<string> prev_data)
+        {
+            CanMessage cmsg;
+            if (TryReceive(prev_data, out cmsg))
+            {
+                return cmsg;
+            }
+
             return default(CanMessage);
         }
     }

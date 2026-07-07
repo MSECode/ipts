@@ -48,11 +48,26 @@ namespace iCubProductionTestSuite.classes
         {
             this.testInterfaces = tis;
             this.operation = op;
+            this.canMessages = new List<CanMessage>();
         }
 
         public CommandRunner(Operation op)
         {
            this.operation = op;
+           this.canMessages = new List<CanMessage>();
+        }
+
+        /// <summary>
+        /// Clears the CAN message buffer before starting a new receive operation.
+        /// Call this at the start of ReceivePassFail to ensure clean state.
+        /// </summary>
+        private void ClearCanBuffer()
+        {
+            if (canMessages != null && canMessages.Count > 0)
+            {
+                log.DebugFormat("Clearing CAN buffer with {0} residual messages", canMessages.Count);
+                canMessages.Clear();
+            }
         }
 
         /// <summary>
@@ -193,7 +208,15 @@ namespace iCubProductionTestSuite.classes
             {
                 if (ti.Name.Equals("CAN"))
                 {
-                    canUtils = new CanUtils(ti);
+                    if (canUtils == null)
+                    {
+                        canUtils = new CanUtils(ti);
+                    }
+                    else
+                    {
+                        canUtils.Configure(ti);
+                    }
+
                     return canUtils.send(data);
                 }
             }
@@ -320,6 +343,9 @@ namespace iCubProductionTestSuite.classes
 
         public void ReceivePassFail(Operation prevSend)
         {
+            // CRITICAL FIX: Clear CAN buffer before processing new receive operation
+            ClearCanBuffer();
+
             List<String> prev_data = new List<string>();
             prev_data.Add(prevSend.Command);
             log.DebugFormat("Adding to prev_data the prevSend.Command {0}", prevSend.Command);
@@ -339,7 +365,9 @@ namespace iCubProductionTestSuite.classes
 
             if (testInterfaces == null || testInterfaces.Count == 0) { Pass = false; return; }
 
-            int nrMess = Convert.ToInt16(operation.LogMess);
+            // logMess controls how many CAN response frames are collected for logging.
+            // The first byte of the first response frame is still the PASS/FAIL/status byte.
+            int responseFrameCount = Convert.ToInt16(operation.LogMess);
 
             switch (operation.Interf)
             {
@@ -348,15 +376,111 @@ namespace iCubProductionTestSuite.classes
                     {
                         if (ti.Name.Equals("CAN"))
                         {
-                            canUtils = new CanUtils(ti);
-                            if (nrMess > 0) for (int i = 0; i < nrMess; i++) canMessages.Add(canUtils.receive(prev_data));
-                            else canMessages.Add(canUtils.receive(prev_data));
-                            string[] vpl = operation.ValPass.Split(' ');
-                            for (int i = 0; i < vpl.Length; i++)
+                            try
                             {
-                                int b = canMessages[0][i];
-                                int value = Convert.ToInt32(vpl[i], 16);
-                                if (!b.Equals(value)) Pass = false;
+                                if (canUtils == null)
+                                {
+                                    canUtils = new CanUtils(ti);
+                                    log.InfoFormat("Created CanUtils instance for CAN receive");
+                                }
+                                else
+                                {
+                                    canUtils.Configure(ti);
+                                    log.InfoFormat("Reusing CanUtils instance for CAN receive");
+                                }
+
+                                // FIXED: Receive messages with proper timeout and buffer management
+                                if (responseFrameCount  > 0)
+                                {
+                                    log.DebugFormat("Receiving {0} CAN messages with timeout", responseFrameCount );
+                                    for (int i = 0; i < responseFrameCount ; i++)
+                                    {
+                                        try
+                                        {
+                                            CanMessage msg;
+                                            if (canUtils.TryReceive(prev_data, out msg))
+                                            {
+                                                canMessages.Add(msg);
+                                                log.DebugFormat("Received CAN message {0}/{1}", i + 1, responseFrameCount );
+                                            }
+                                            else
+                                            {
+                                                log.WarnFormat("CAN message {0}/{1} was null", i + 1, responseFrameCount );
+                                                Pass = false;
+                                                break;
+                                            }
+                                        }
+                                        catch (TimeoutException tex)
+                                        {
+                                            log.WarnFormat("Timeout waiting for CAN message {0}/{1}: {2}", i + 1, responseFrameCount , tex.Message);
+                                            Pass = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    log.Debug("Receiving single CAN message");
+                                    CanMessage msg;
+                                    if (canUtils.TryReceive(prev_data, out msg))
+                                    {
+                                        canMessages.Add(msg);
+                                        log.Debug("Received single CAN message");
+                                    }
+                                    else
+                                    {
+                                        log.Warn("Received CAN message was null");
+                                        Pass = false;
+                                        break;
+                                    }
+                                }
+
+                                // FIXED: Validate buffer has messages before accessing
+                                if (canMessages.Count == 0)
+                                {
+                                    log.Error("No CAN messages received - buffer is empty");
+                                    Pass = false;
+                                }
+                                else
+                                {
+                                    // Validate the first received message against expected values
+                                    string[] vpl = operation.ValPass.Split(' ');
+                                    CanMessage firstMsg = canMessages[0];
+                                    
+                                    log.DebugFormat("Validating CAN message against {0} expected bytes", vpl.Length);
+                                    
+                                    for (int i = 0; i < vpl.Length; i++)
+                                    {
+                                        if (i >= firstMsg.DataLength)
+                                        {
+                                            log.WarnFormat("Expected byte {0} but message only has {1} bytes", i, firstMsg.DataLength);
+                                            Pass = false;
+                                            break;
+                                        }
+
+                                        int b = firstMsg[i];
+                                        int value = Convert.ToInt32(vpl[i], 16);
+                                        
+                                        if (!b.Equals(value))
+                                        {
+                                            log.WarnFormat("CAN message byte {0} mismatch: expected 0x{1:X2}, got 0x{2:X2}", i, value, b);
+                                            Pass = false;
+                                            break;
+                                        }
+                                    }
+
+                                    if (Pass)
+                                    {
+                                        log.InfoFormat("CAN message validation passed for all {0} bytes", vpl.Length);
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Pass = false;
+                                log.Error("Error in CAN receivePassFail", ex);
+                                MessageBox.Show("Errore nella ricezione CAN: " + ex.Message, "Errore",
+                                                MessageBoxButtons.OK, MessageBoxIcon.Error);
                             }
                         }
                     }
